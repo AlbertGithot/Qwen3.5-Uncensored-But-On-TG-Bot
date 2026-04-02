@@ -13,4 +13,5 @@ models/
 llama.cpp/
 
 telegram_llama_bot_qwen35_pretrained.py
+telegram_llama_bot_local_config.py
 LICENSE.agpl.test
