@@ -10,15 +10,27 @@ import re
 import subprocess
 import sys
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+from bot_control_db import (
+    bootstrap_from_interactions,
+    get_setting,
+    init_db,
+    is_user_blocked,
+    record_event as record_db_event,
+    set_setting,
+    upsert_user,
+)
+
+init_db()
+
 try:
     from aiogram import Bot, Dispatcher, F, Router
-    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.exceptions import TelegramBadRequest, TelegramUnauthorizedError
     from aiogram.filters import Command, CommandStart
     from aiogram.types import (
         CallbackQuery,
@@ -68,9 +80,11 @@ def env_bool(name: str, default: bool) -> bool:
 def env_path(name: str, default: str) -> Path:
     return Path(os.getenv(name, default)).expanduser()
 
-
 BOT_TOKEN = env_str("BOT_TOKEN")
-MODEL_PATH = env_path("MODEL_PATH", "./models/model.gguf")
+MODEL_PATH = env_path(
+    "MODEL_PATH",
+    get_setting("selected_model_path", "./models/model.gguf") or "./models/model.gguf",
+)
 LLAMA_CPP_DIR = env_path("LLAMA_CPP_DIR", "./llama.cpp")
 LLAMA_SERVER_EXE = env_path(
     "LLAMA_SERVER_EXE",
@@ -103,7 +117,13 @@ SYSTEM_PROMPT = (
 # вроде 'chatml', 'llama-2', 'mistral-instruct' и т.д. Иначе оставь None.
 CHAT_FORMAT: str | None = env_str("CHAT_FORMAT", "qwen") or None
 
-MAX_HISTORY_MESSAGES = env_int("MAX_HISTORY_MESSAGES", 12)
+MAX_HISTORY_MESSAGES = env_int("MAX_HISTORY_MESSAGES", 10)
+MAX_HISTORY_ENTRY_CHARS = env_int("MAX_HISTORY_ENTRY_CHARS", 2500)
+MAX_ACTIVE_DIALOGS = env_int("MAX_ACTIVE_DIALOGS", 200)
+MAX_USER_TEXT_CHARS = env_int("MAX_USER_TEXT_CHARS", 6000)
+MAX_MULTI_REQUEST_TEXT_CHARS = env_int("MAX_MULTI_REQUEST_TEXT_CHARS", 2000)
+MAX_LOG_TEXT_CHARS = env_int("MAX_LOG_TEXT_CHARS", 6000)
+MAX_MODEL_REPLY_CHARS = env_int("MAX_MODEL_REPLY_CHARS", 24000)
 
 N_CTX = env_int("N_CTX", 32768)
 N_THREADS = max(1, (os.cpu_count() or 4) - 1)
@@ -123,7 +143,7 @@ SHOW_MODEL_RAW = env_bool("SHOW_MODEL_RAW", True)
 USE_RAW_MODEL_REPLY = env_bool("USE_RAW_MODEL_REPLY", True)
 ENABLE_REPAIR_PASS = env_bool("ENABLE_REPAIR_PASS", True)
 THINKING_PLACEHOLDER_TEXT = "Подожди, я думаю...."
-MAX_TRACKED_BOT_MESSAGES = 120
+MAX_TRACKED_BOT_MESSAGES = env_int("MAX_TRACKED_BOT_MESSAGES", 80)
 PROJECT_ROOT = Path(__file__).resolve().parent
 LICENSE_FILE_PATH = PROJECT_ROOT / "LICENSE"
 RESET_DIALOG_CALLBACK = "dialog:reset_clear"
@@ -147,7 +167,7 @@ INEEDMORE_WELCOME_TEXT = (
     "Важно помнить! При попытке написать якобы \"взаимосвязанные\" запросы в шаблоны, бот их учитывать не будет. "
     "Причиной служит то, что внутри /ineedmore память чата у бота не используется. "
     "Так что если вы хотите связать запросы, уточняйте в каждом. "
-    "Мы(я) не несу ответственность за ваши действия с ИИ(указано в MIT лицензии) Спасибо!\n"
+    "Мы(я) не несу ответственность за ваши действия с ИИ(указано в GNU AGPLv3) Спасибо!\n"
     "* -  В случае превышения лимитов Telegram, бот может написать двумя, а то и тремя сообщениями."
 )
 
@@ -177,7 +197,7 @@ BRIEF_REPLY_STYLE_PROMPT = (
     "Только финальный ответ."
 )
 BRIEF_REPLY_MAX_CHARS = 320
-PROMPT_SNAPSHOT_SIGNATURE = "v4-minimal-no-echo"
+PROMPT_SNAPSHOT_SIGNATURE = "v5-local-config-and-limits"
 
 LOG_DIR = Path("bot_logs")
 RUNTIME_LOG_PATH = LOG_DIR / "runtime.log"
@@ -191,6 +211,7 @@ chat_locks: dict[int, asyncio.Lock] = {}
 multi_request_sessions: dict[str, dict[str, Any]] = {}
 bot_response_message_ids: dict[str, deque[int]] = {}
 dialog_prompt_snapshots: dict[str, str] = {}
+dialog_activity_order: OrderedDict[str, None] = OrderedDict()
 model_lock: asyncio.Lock | None = None
 LLAMA_SERVER_PROCESS: subprocess.Popen[str] | None = None
 LLAMA_SERVER_LOG_HANDLE: Any | None = None
@@ -230,11 +251,60 @@ def setup_logging() -> None:
     logger.addHandler(stream_handler)
 
 
+def truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= 3:
+        return text[:max_chars]
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def sanitize_for_log(value: Any) -> Any:
+    if isinstance(value, str):
+        return truncate_text(value, MAX_LOG_TEXT_CHARS)
+    if isinstance(value, dict):
+        return {str(key): sanitize_for_log(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_for_log(item) for item in value]
+    return value
+
+
 def append_jsonl(record: dict[str, Any]) -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    with INTERACTIONS_LOG_PATH.open("a", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False)
-        handle.write("\n")
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with INTERACTIONS_LOG_PATH.open("a", encoding="utf-8") as handle:
+            json.dump(sanitize_for_log(record), handle, ensure_ascii=False)
+            handle.write("\n")
+        record_db_event(record)
+    except Exception:
+        logger.exception("Не удалось записать JSONL лог.")
+
+
+def trim_history_text(text: str) -> str:
+    return truncate_text(text.strip(), MAX_HISTORY_ENTRY_CHARS)
+
+
+def append_reply_chunk(current: str, chunk: str) -> tuple[str, bool]:
+    updated = current + chunk
+    if len(updated) <= MAX_MODEL_REPLY_CHARS:
+        return updated, False
+    return updated[:MAX_MODEL_REPLY_CHARS], True
+
+
+def touch_dialog_state(dialog_key: str) -> None:
+    dialog_activity_order.pop(dialog_key, None)
+    dialog_activity_order[dialog_key] = None
+    prune_dialog_state()
+
+
+def prune_dialog_state() -> None:
+    while len(dialog_activity_order) > MAX_ACTIVE_DIALOGS:
+        stale_dialog_key, _ = dialog_activity_order.popitem(last=False)
+        dialog_histories.pop(stale_dialog_key, None)
+        bot_response_message_ids.pop(stale_dialog_key, None)
+        dialog_prompt_snapshots.pop(stale_dialog_key, None)
+        multi_request_sessions.pop(stale_dialog_key, None)
+        logger.info("Удаляю старое состояние диалога из памяти: dialog_key=%s", stale_dialog_key)
 
 
 def build_license_notice_text() -> str:
@@ -244,6 +314,10 @@ def build_license_notice_text() -> str:
     )
 
 
+def is_ai_enabled() -> bool:
+    return (get_setting("ai_enabled", "1") or "1").strip() not in {"0", "false", "False"}
+
+
 def build_start_keyboard() -> InlineKeyboardMarkup:
     inline_keyboard = [
         [
@@ -251,7 +325,7 @@ def build_start_keyboard() -> InlineKeyboardMarkup:
                 text="Показать лицензию GNU AGPLv3",
                 callback_data=LICENSE_CALLBACK,
             )
-        ]
+        ],
     ]
     if SOURCE_URL:
         inline_keyboard.append(
@@ -336,7 +410,10 @@ def create_multi_request_session() -> dict[str, Any]:
 
 
 def get_multi_request_session(dialog_key: str) -> dict[str, Any] | None:
-    return multi_request_sessions.get(dialog_key)
+    session = multi_request_sessions.get(dialog_key)
+    if session is not None:
+        touch_dialog_state(dialog_key)
+    return session
 
 
 def render_multi_request_form(topic: str, queries: list[str]) -> str:
@@ -456,17 +533,20 @@ async def safe_edit_message(
             return result
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
-            raise
+            logger.exception("Не удалось отредактировать сообщение Telegram.")
+    except Exception:
+        logger.exception("Не удалось отредактировать сообщение Telegram.")
     return message
 
 
 async def answer_long(message: Message, text: str, dialog_key: str | None = None) -> None:
     dialog_key = dialog_key or get_dialog_key(message)
     reply_markup = build_response_keyboard()
+    transport_text = truncate_text(text, MAX_MODEL_REPLY_CHARS)
     chunks = [
-        text[i : i + TELEGRAM_SEGMENT_LIMIT]
-        for i in range(0, len(text), TELEGRAM_SEGMENT_LIMIT)
-    ] or [text]
+        transport_text[i : i + TELEGRAM_SEGMENT_LIMIT]
+        for i in range(0, len(transport_text), TELEGRAM_SEGMENT_LIMIT)
+    ] or [transport_text]
 
     first_chunk = chunks[0]
     try:
@@ -475,11 +555,27 @@ async def answer_long(message: Message, text: str, dialog_key: str | None = None
             message = result
     except TelegramBadRequest:
         message = await message.answer(first_chunk, reply_markup=reply_markup)
+    except Exception:
+        logger.exception("Не удалось отправить первый фрагмент длинного ответа через edit_text.")
+        message = await message.answer(first_chunk, reply_markup=reply_markup)
     track_bot_message(dialog_key, message)
 
     for chunk in chunks[1:]:
-        message = await message.answer(chunk, reply_markup=reply_markup)
-        track_bot_message(dialog_key, message)
+        try:
+            message = await message.answer(chunk, reply_markup=reply_markup)
+            track_bot_message(dialog_key, message)
+        except Exception:
+            logger.exception("Не удалось отправить длинный фрагмент ответа в Telegram.")
+            break
+
+
+def get_text_limit_error(text: str, limit: int, label: str) -> str | None:
+    if len(text) <= limit:
+        return None
+    return (
+        f"{label} слишком длинный. Сейчас {len(text)} символов, "
+        f"лимит {limit}. Укороти и отправь ещё раз."
+    )
 
 
 def validate_config() -> None:
@@ -505,6 +601,7 @@ def get_callback_dialog_key(callback: CallbackQuery) -> str:
 
 
 def get_tracked_bot_messages(dialog_key: str) -> deque[int]:
+    touch_dialog_state(dialog_key)
     tracked = bot_response_message_ids.get(dialog_key)
     if tracked is None:
         tracked = deque(maxlen=MAX_TRACKED_BOT_MESSAGES)
@@ -529,6 +626,7 @@ def forget_tracked_bot_messages(dialog_key: str) -> list[int]:
 
 
 def get_dialog_history(dialog_key: str) -> deque[dict[str, str]]:
+    touch_dialog_state(dialog_key)
     history = dialog_histories.get(dialog_key)
     if history is None:
         history = deque(maxlen=MAX_HISTORY_MESSAGES)
@@ -580,6 +678,22 @@ def chat_payload(message: Message) -> dict[str, Any]:
         "type": message.chat.type,
         "title": getattr(message.chat, "title", None),
     }
+
+
+async def reject_if_blocked_message(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_user_blocked(user_id):
+        return False
+    await message.answer("Доступ к боту заблокирован администратором.")
+    return True
+
+
+async def reject_if_blocked_callback(callback: CallbackQuery) -> bool:
+    user_id = callback.from_user.id if callback.from_user else None
+    if not is_user_blocked(user_id):
+        return False
+    await callback.answer("Доступ к боту заблокирован администратором.", show_alert=True)
+    return True
 
 
 def should_answer_briefly(user_text: str) -> bool:
@@ -703,7 +817,10 @@ def get_system_prompt_for_request(user_text: str) -> str:
 def build_messages(dialog_key: str, user_text: str) -> list[dict[str, str]]:
     ensure_prompt_snapshot(dialog_key)
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": build_system_message_content(user_text)}
+        {
+            "role": "system",
+            "content": build_system_message_content(user_text),
+        }
     ]
     messages.extend(get_request_history(dialog_key, user_text))
     messages.append({"role": "user", "content": user_text})
@@ -779,13 +896,14 @@ def build_brief_retry_messages(user_text: str) -> list[dict[str, str]]:
 
 def remember_turn(dialog_key: str, user_text: str, bot_text: str) -> None:
     history = get_dialog_history(dialog_key)
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": bot_text})
+    history.append({"role": "user", "content": trim_history_text(user_text)})
+    history.append({"role": "assistant", "content": trim_history_text(bot_text)})
 
 
 def reset_dialog(dialog_key: str) -> None:
     dialog_histories.pop(dialog_key, None)
     dialog_prompt_snapshots.pop(dialog_key, None)
+    dialog_activity_order.pop(dialog_key, None)
 
 
 def build_llama_server_command() -> list[str]:
@@ -1466,6 +1584,9 @@ async def stream_model_reply(messages: list[dict[str, str]], max_tokens: int) ->
         print("\n[MODEL RAW] ", end="", flush=True)
 
     try:
+        if not is_ai_enabled():
+            raise RuntimeError("ИИ выключен через панель управления.")
+        await ensure_llama_server_running()
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(LLAMA_SERVER_CHAT_URL, json=payload) as response:
                 if response.status >= 400:
@@ -1525,7 +1646,11 @@ async def collect_model_reply_unlocked(
         if event["type"] == "done":
             finish_reason = event.get("finish_reason")
             continue
-        raw_reply += event["text"]
+        raw_reply, truncated = append_reply_chunk(raw_reply, event["text"])
+        if truncated:
+            logger.warning("Ответ модели обрезан по MAX_MODEL_REPLY_CHARS=%s", MAX_MODEL_REPLY_CHARS)
+            finish_reason = finish_reason or "length"
+            break
 
     if USE_RAW_MODEL_REPLY:
         full_reply = normalize_raw_model_reply(raw_reply)
@@ -1633,7 +1758,10 @@ class StreamingTelegramEditor:
 
 @router.message(CommandStart())
 async def handle_start(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     dialog_key = get_dialog_key(message)
+    touch_dialog_state(dialog_key)
     logger.info(
         "Пользователь активировал бота: chat_id=%s user_id=%s username=%s",
         message.chat.id,
@@ -1662,12 +1790,16 @@ async def handle_start(message: Message) -> None:
 
 @router.message(Command("license"))
 async def handle_license(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     sent = await message.answer(build_license_notice_text())
     track_bot_message(get_dialog_key(message), sent)
 
 
 @router.callback_query(F.data == LICENSE_CALLBACK)
 async def handle_license_callback(callback: CallbackQuery) -> None:
+    if await reject_if_blocked_callback(callback):
+        return
     if callback.message is not None:
         sent = await callback.message.answer(build_license_notice_text())
         track_bot_message(get_callback_dialog_key(callback), sent)
@@ -1676,6 +1808,8 @@ async def handle_license_callback(callback: CallbackQuery) -> None:
 
 @router.message(Command("source"))
 async def handle_source(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     text = (
         f"Исходный код: {SOURCE_URL}"
         if SOURCE_URL
@@ -1687,6 +1821,8 @@ async def handle_source(message: Message) -> None:
 
 @router.callback_query(F.data == SOURCE_CODE_CALLBACK)
 async def handle_source_callback(callback: CallbackQuery) -> None:
+    if await reject_if_blocked_callback(callback):
+        return
     if callback.message is not None:
         text = (
             f"Исходный код: {SOURCE_URL}"
@@ -1700,6 +1836,8 @@ async def handle_source_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == RESET_DIALOG_CALLBACK)
 async def handle_reset_dialog_callback(callback: CallbackQuery) -> None:
+    if await reject_if_blocked_callback(callback):
+        return
     dialog_key = get_callback_dialog_key(callback)
     reset_dialog(dialog_key)
     multi_request_sessions.pop(dialog_key, None)
@@ -1730,6 +1868,8 @@ async def handle_reset_dialog_callback(callback: CallbackQuery) -> None:
 
 @router.message(Command("reset"))
 async def handle_reset(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     dialog_key = get_dialog_key(message)
     reset_dialog(dialog_key)
     multi_request_sessions.pop(dialog_key, None)
@@ -1749,7 +1889,10 @@ async def handle_reset(message: Message) -> None:
 
 @router.message(Command("ineedmore"))
 async def handle_ineedmore(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     dialog_key = get_dialog_key(message)
+    touch_dialog_state(dialog_key)
     session = create_multi_request_session()
     multi_request_sessions[dialog_key] = session
     append_jsonl(
@@ -1809,13 +1952,15 @@ async def process_multi_request(
         async with model_lock:
             statuses[index] = "thinking"
             await refresh_status()
-            reply, raw_reply, _ = await collect_model_reply_unlocked(
-                messages, INEEDMORE_ITEM_MAX_TOKENS
-            )
+            reply, raw_reply, _ = await collect_model_reply_unlocked(messages, INEEDMORE_ITEM_MAX_TOKENS)
             if needs_repair_pass(reply, raw_reply, brief_mode=False):
                 repair_messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "system", "content": REPAIR_SYSTEM_PROMPT},
+                    {
+                        "role": "system",
+                        "content": build_system_message_content(
+                            query, REPAIR_SYSTEM_PROMPT, base_prompt=SYSTEM_PROMPT
+                        ),
+                    },
                     {
                         "role": "user",
                         "content": (
@@ -1823,9 +1968,7 @@ async def process_multi_request(
                         ),
                     },
                 ]
-                repaired_reply, _, _ = await collect_model_reply_unlocked(
-                    repair_messages, INEEDMORE_ITEM_MAX_TOKENS
-                )
+                repaired_reply, _, _ = await collect_model_reply_unlocked(repair_messages, INEEDMORE_ITEM_MAX_TOKENS)
                 if repaired_reply.strip():
                     reply = repaired_reply
 
@@ -1846,7 +1989,9 @@ async def process_multi_request(
         await refresh_status("Собираю общий итог 🧩")
         intro_messages = build_multi_request_intro_messages(topic, queries, answers)
         intro, _, _ = await collect_model_reply(
-            intro_messages, INEEDMORE_INTRO_MAX_TOKENS, brief_mode=True
+            intro_messages,
+            INEEDMORE_INTRO_MAX_TOKENS,
+            brief_mode=True,
         )
         intro = intro.strip()
         if not intro:
@@ -1888,6 +2033,8 @@ async def process_multi_request(
 
 @router.callback_query(F.data.startswith(INEEDMORE_CALLBACK_PREFIX))
 async def handle_ineedmore_callback(callback: CallbackQuery) -> None:
+    if await reject_if_blocked_callback(callback):
+        return
     if callback.message is None or callback.data is None:
         await callback.answer()
         return
@@ -2017,16 +2164,27 @@ async def handle_ineedmore_callback(callback: CallbackQuery) -> None:
 async def handle_text(message: Message, bot: Bot) -> None:
     global model_lock
 
+    if await reject_if_blocked_message(message):
+        return
+
     text = (message.text or "").strip()
     if not text:
         await message.answer("Пустое сообщение не обрабатываю.")
         return
 
     dialog_key = get_dialog_key(message)
+    user_id = message.from_user.id if message.from_user else None
     chat_lock = get_chat_lock(message.chat.id)
     multi_session = get_multi_request_session(dialog_key)
 
     if multi_session is not None:
+        too_long_error = get_text_limit_error(
+            text, MAX_MULTI_REQUEST_TEXT_CHARS, "Текст для /ineedmore"
+        )
+        if too_long_error:
+            await message.answer(too_long_error)
+            return
+
         edit_target = multi_session.get("edit_target")
         if isinstance(edit_target, str):
             if edit_target == "topic":
@@ -2066,6 +2224,17 @@ async def handle_text(message: Message, bot: Bot) -> None:
             return
 
         topic, queries = parsed_form
+        topic_error = get_text_limit_error(topic, MAX_MULTI_REQUEST_TEXT_CHARS, "Тема")
+        if topic_error:
+            await message.answer(topic_error)
+            return
+        for index, query in enumerate(queries, start=1):
+            query_error = get_text_limit_error(
+                query, MAX_MULTI_REQUEST_TEXT_CHARS, f"Запрос {index}"
+            )
+            if query_error:
+                await message.answer(query_error)
+                return
         multi_session["topic"] = topic
         multi_session["queries"] = queries
         append_jsonl(
@@ -2082,6 +2251,11 @@ async def handle_text(message: Message, bot: Bot) -> None:
             render_multi_request_form(topic, queries),
             reply_markup=build_ineedmore_keyboard(len(queries)),
         )
+        return
+
+    user_text_too_long = get_text_limit_error(text, MAX_USER_TEXT_CHARS, "Сообщение")
+    if user_text_too_long:
+        await message.answer(user_text_too_long)
         return
 
     if chat_lock.locked():
@@ -2142,7 +2316,15 @@ async def handle_text(message: Message, bot: Bot) -> None:
                             continue
 
                         chunk = event["text"]
-                        raw_reply += chunk
+                        raw_reply, truncated = append_reply_chunk(raw_reply, chunk)
+                        if truncated:
+                            logger.warning(
+                                "Ответ модели обрезан по MAX_MODEL_REPLY_CHARS=%s: request_id=%s",
+                                MAX_MODEL_REPLY_CHARS,
+                                request_id,
+                            )
+                            reply_finish_reason = reply_finish_reason or "length"
+                            break
 
                     if USE_RAW_MODEL_REPLY:
                         full_reply = normalize_raw_model_reply(raw_reply)
@@ -2185,12 +2367,19 @@ async def handle_text(message: Message, bot: Bot) -> None:
                         retry_raw_reply = ""
                         retry_messages = build_brief_retry_messages(text)
 
-                        async for event in stream_model_reply(
-                            retry_messages, request_max_tokens
-                        ):
+                        async for event in stream_model_reply(retry_messages, request_max_tokens):
                             if event["type"] == "done":
                                 continue
-                            retry_raw_reply += event["text"]
+                            retry_raw_reply, truncated = append_reply_chunk(
+                                retry_raw_reply, event["text"]
+                            )
+                            if truncated:
+                                logger.warning(
+                                    "Retry-ответ обрезан по MAX_MODEL_REPLY_CHARS=%s: request_id=%s",
+                                    MAX_MODEL_REPLY_CHARS,
+                                    request_id,
+                                )
+                                break
 
                         retried_reply = extract_visible_reply(retry_raw_reply, final=True)
                         retried_reply = compress_brief_reply(retried_reply)
@@ -2215,12 +2404,19 @@ async def handle_text(message: Message, bot: Bot) -> None:
                         repair_raw_reply = ""
                         repair_messages = build_repair_messages(dialog_key, text)
 
-                        async for event in stream_model_reply(
-                            repair_messages, request_max_tokens
-                        ):
+                        async for event in stream_model_reply(repair_messages, request_max_tokens):
                             if event["type"] == "done":
                                 continue
-                            repair_raw_reply += event["text"]
+                            repair_raw_reply, truncated = append_reply_chunk(
+                                repair_raw_reply, event["text"]
+                            )
+                            if truncated:
+                                logger.warning(
+                                    "Repair-ответ обрезан по MAX_MODEL_REPLY_CHARS=%s: request_id=%s",
+                                    MAX_MODEL_REPLY_CHARS,
+                                    request_id,
+                                )
+                                break
 
                         repaired_reply = extract_visible_reply(
                             repair_raw_reply, final=True
@@ -2313,18 +2509,20 @@ async def handle_text(message: Message, bot: Bot) -> None:
 
 @router.message()
 async def handle_other(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
     await message.answer("Я сейчас принимаю только обычный текст.")
 
 
-async def main() -> None:
+async def bot_worker_main() -> None:
     global model_lock
 
     ensure_stdout_utf8()
     setup_logging()
+    bootstrap_from_interactions(INTERACTIONS_LOG_PATH)
     validate_config()
 
     model_lock = asyncio.Lock()
-    await ensure_llama_server_running()
 
     bot = Bot(token=BOT_TOKEN)
     dispatcher = Dispatcher()
@@ -2341,11 +2539,50 @@ async def main() -> None:
         stop_llama_server()
 
 
+def run_ai_worker() -> None:
+    ensure_stdout_utf8()
+    setup_logging()
+    bootstrap_from_interactions(INTERACTIONS_LOG_PATH)
+    validate_config()
+    logger.info("AI worker запущен.")
+    start_llama_server()
+    if LLAMA_SERVER_PROCESS is None:
+        raise RuntimeError("Не удалось запустить llama-server.")
+    try:
+        exit_code = LLAMA_SERVER_PROCESS.wait()
+        logger.info("AI worker завершён, llama-server exit_code=%s", exit_code)
+    finally:
+        stop_llama_server()
+
+
+def launch_control_panel() -> None:
+    from bot_control_panel import launch_control_panel as launch_gui
+
+    bootstrap_from_interactions(INTERACTIONS_LOG_PATH)
+    launch_gui(
+        script_path=Path(__file__).resolve(),
+        project_root=PROJECT_ROOT,
+        model_path=MODEL_PATH,
+    )
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        mode = sys.argv[1] if len(sys.argv) > 1 else "--gui"
+        if mode == "--bot-worker":
+            asyncio.run(bot_worker_main())
+        elif mode == "--server-worker":
+            run_ai_worker()
+        else:
+            launch_control_panel()
     except KeyboardInterrupt:
         print("\nОстановлено вручную.", flush=True)
+    except TelegramUnauthorizedError:
+        print(
+            "\nКритическая ошибка: Telegram отклонил токен бота. "
+            "Проверь BOT_TOKEN в переменных окружения.",
+            flush=True,
+        )
     except Exception as exc:
         print(f"\nКритическая ошибка: {exc}", flush=True)
         raise

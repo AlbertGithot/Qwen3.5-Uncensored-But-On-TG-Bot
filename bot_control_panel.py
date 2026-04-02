@@ -14,7 +14,6 @@ import tkinter as tk
 from tkinter import scrolledtext, ttk
 from typing import Any
 
-import telegram_llama_bot_local_config as local_config
 from bot_control_db import (
     get_dialog_messages,
     get_setting,
@@ -44,6 +43,13 @@ def env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return float(value)
+
+
 def current_model_path(default: Path) -> Path:
     return Path(get_setting("selected_model_path", str(default)) or str(default))
 
@@ -57,8 +63,8 @@ def set_ai_enabled(enabled: bool) -> None:
 
 
 def llama_base_url() -> str:
-    host = env_str("LLAMA_SERVER_HOST", local_config.LLAMA_SERVER_HOST)
-    port = env_int("LLAMA_SERVER_PORT", local_config.LLAMA_SERVER_PORT)
+    host = env_str("LLAMA_SERVER_HOST", "127.0.0.1")
+    port = env_int("LLAMA_SERVER_PORT", 8080)
     return f"http://{host}:{port}"
 
 
@@ -166,11 +172,11 @@ def direct_ai_request(prompt: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": local_config.MAX_TOKENS,
-        "temperature": local_config.TEMPERATURE,
-        "top_p": local_config.TOP_P,
-        "top_k": local_config.TOP_K,
-        "repeat_penalty": local_config.REPEAT_PENALTY,
+        "max_tokens": env_int("MAX_TOKENS", 3072),
+        "temperature": env_float("TEMPERATURE", 0.6),
+        "top_p": env_float("TOP_P", 0.95),
+        "top_k": env_int("TOP_K", 20),
+        "repeat_penalty": env_float("REPEAT_PENALTY", 1.1),
         "stream": False,
     }
     request = urllib.request.Request(
@@ -478,7 +484,7 @@ class ControlPanelApp:
             child.destroy()
 
         users = get_users()
-        token = local_config.BOT_TOKEN
+        token = env_str("BOT_TOKEN")
         for user in users:
             card = ttk.Frame(self.user_cards_frame, padding=12, relief="groove")
             card.pack(fill="x", expand=True, pady=6)
