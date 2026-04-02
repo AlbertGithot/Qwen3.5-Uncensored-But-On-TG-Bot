@@ -1,40 +1,63 @@
-# Qwen3.5 Uncensored Telegram Bot
+# 🤖 Qwen3.5 Uncensored Telegram Bot
 
 Telegram bot for local GGUF models on top of `llama.cpp`.
 
-The project now includes a desktop control panel, a small SQLite database for bot activity, a direct AI request window, and a Telegram bot worker managed from one entrypoint.
+This project includes a Telegram bot, a desktop control panel, a SQLite database for activity tracking, and a direct AI interaction interface — all managed from a single entrypoint.
 
-## What It Does
+---
 
-- Runs a Telegram bot with `aiogram`
-- Starts and uses local `llama-server` from `llama.cpp`
-- Stores basic bot activity in SQLite
-- Keeps short dialog memory
-- Supports `/ineedmore` for grouped requests
-- Shows recent logs in a control panel
-- Lets the operator:
-  - enable or disable AI
-  - start or stop the Telegram worker
-  - choose a `.gguf` model
-  - inspect users and dialogs
-  - block or unblock users
-  - send direct prompts to the model
+## 📌 Description
 
-## Project Files
+This project provides a fully local AI-powered Telegram bot system with:
 
-- `bot.py` - main entrypoint
-- `bot_control_panel.py` - desktop control panel
-- `bot_control_db.py` - SQLite helpers
-- `bot_control.db` - runtime database, created automatically
+* local LLM inference via `llama.cpp`
+* desktop control panel for management
+* built-in SQLite database
+* direct interaction with the model outside Telegram
 
-## Requirements
+Designed for full control, experimentation, and uncensored AI usage.
 
-- Python 3.11+
-- Windows build of `llama.cpp` with `llama-server.exe`
-- Local GGUF model
-- Python packages from `requirements.txt`
-- `tkinter` for the control panel
-- `Pillow` is optional if you want Telegram avatars in the user list
+---
+
+## ⚙️ Features
+
+* `aiogram` Telegram bot
+* Automatic `llama-server` startup
+* Local GGUF model support
+* Desktop control panel (tkinter)
+* SQLite database for bot activity
+* Dialog memory
+* `/ineedmore` grouped requests
+* Streamed responses in Telegram
+* Raw model output in terminal logs
+
+### 🧩 Control Panel Capabilities
+
+* Enable / disable AI
+* Start / stop Telegram worker
+* Select `.gguf` model
+* View users and dialogs
+* Block / unblock users
+* Send direct prompts to the model
+* View runtime and model logs
+
+---
+
+## 📁 Project Structure
+
+* `bot.py` — main entrypoint
+* `bot_control_panel.py` — desktop control panel
+* `bot_control_db.py` — SQLite helpers
+* `bot_control.db` — runtime database (auto-created)
+
+---
+
+## 📦 Requirements
+
+* Python 3.11+
+* Windows build of `llama.cpp` with `llama-server.exe`
+* Local GGUF model
+* `tkinter` (for control panel)
 
 Install dependencies:
 
@@ -48,11 +71,11 @@ Optional:
 pip install pillow
 ```
 
-## Configuration
+---
 
-Set the environment variables before launch.
+## ⚙️ Configuration
 
-Minimum useful setup:
+Set environment variables before launch:
 
 ```powershell
 $env:BOT_TOKEN="your_telegram_bot_token"
@@ -62,17 +85,19 @@ $env:LLAMA_SERVER_EXE="C:\Tools\llama.cpp\b8625\llama-server.exe"
 $env:SOURCE_URL="https://github.com/AlbertGithot/Qwen3.5-Uncensored-But-On-TG-Bot.git"
 ```
 
-Additional runtime settings are listed in `.env.example`.
+Additional settings are available in `.env.example`.
 
-Important notes:
+### 🔹 Notes
 
-- `bot.py` does not depend on `telegram_llama_bot_local_config.py`
-- the selected model path can also be changed from the control panel
-- the bot uses `llama-server` over local HTTP, not `llama-cpp-python`
+* `bot.py` does NOT depend on legacy config files
+* Model path can be changed from the control panel
+* Uses `llama-server` over HTTP (not `llama-cpp-python`)
 
-## Run
+---
 
-Default mode opens the control panel:
+## 🚀 Run
+
+Default mode (control panel):
 
 ```powershell
 python bot.py
@@ -85,63 +110,119 @@ python bot.py --server-worker
 python bot.py --bot-worker
 ```
 
-## Control Panel
+---
 
-After launch, the panel has four sections:
+## 🖥️ Control Panel
 
-- `Management`
-  - enable or disable AI
-  - start or stop the Telegram bot
-  - choose a model
-  - check current status
-- `Database`
-  - view users
-  - inspect dialogs
-  - block or unblock access
-- `Direct AI`
-  - send prompts to the local model without Telegram
-- `Terminal`
-  - view recent runtime and `llama-server` logs
+Includes four main sections:
 
-## Telegram Side
+### Management
 
-The bot includes:
+* Enable / disable AI
+* Start / stop bot
+* Select model
+* Check status
 
-- dialog reset
-- grouped requests through `/ineedmore`
-- source code link through `/source`
-- license notice through `/license`
-- streamed generation in Telegram
-- raw model output in terminal logs when enabled
+### Database
 
-## Runtime Data
+* View users
+* Inspect dialogs
+* Block / unblock users
 
-Generated locally and normally not committed:
+### Direct AI
 
-- `bot_control.db`
-- `bot_logs/`
-- `__pycache__/`
+* Send prompts directly to the model
 
-## Model
+### Terminal
 
-The repository does not ship a model.
+* View runtime logs
+* View `llama-server` output
 
-Example setup used during development:
+---
 
-- Model: `HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive`
-- Format: `GGUF`
-- Quantization: `Q5_K_M`
+## 🤖 Telegram Features
 
-Model page:
+* Dialog reset
+* `/ineedmore` grouped requests
+* `/source` — source code link
+* `/license` — license notice
+* Streamed responses
+* Optional raw output logging
 
+---
+
+## 📂 Runtime Data
+
+Generated locally and usually not committed:
+
+* `bot_control.db`
+* `bot_logs/`
+* `__pycache__/`
+
+---
+
+## 🧠 Model
+
+Example configuration used during development:
+
+**Model:**
+HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive
 https://huggingface.co/HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive
 
-## License
+* Format: GGUF
+* Quantization: Q5_K_M
+* Size: ~24.8 GB
 
-This repository is published under the GNU Affero General Public License v3.0.
+Licensed under the Apache License 2.0.
 
-If you run it as a network service, you must provide users access to the corresponding source code. Set `SOURCE_URL` so the bot can point users to the repository.
+---
 
-## Repository
+## ⚠️ Recommendations
+
+This project is designed to run with **llama.cpp**.
+
+Using alternatives like `llama-cpp-python` is **not recommended for inexperienced users**.
+It may break the inference pipeline if used incorrectly.
+
+---
+
+## ⚠️ Disclaimer
+
+`bot.py` and parts of the project were generated and adapted with the help of AI.
+The code is not fully reviewed and may contain issues.
+
+---
+
+## 💸 Support the Author
+
+If you like this project, you can support the author:
+
+* **USDT (TON):**
+  UQDCmDuVnhwvZ6EW6qv0J_nV1_7U9-IPCKYo3L279JId0qbU
+
+* **TON:**
+  UQBN03z--f0LsRcODzNLukobgrGIt6lo-MAn-FX7l1KBKZZI
+
+* **BTC:**
+  bc1q4tpzte0efcn9xsf67dcuzw6e749dahnm0j7f8m
+
+---
+
+## 📬 Contact
+
+Telegram: @Default_Netion
+
+---
+
+## 📜 License
+
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
+
+If you run this software as a network service, you must provide access to the source code.
+
+---
+
+## 🔗 Repository
 
 https://github.com/AlbertGithot/Qwen3.5-Uncensored-But-On-TG-Bot.git
+
