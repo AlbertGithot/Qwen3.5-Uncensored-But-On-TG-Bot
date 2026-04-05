@@ -1,4 +1,4 @@
-# 🤖 Qwen3.5 Uncensored Telegram Bot
+# A bridge between a local AI model and a Telegram bot.
 
 Telegram bot for local GGUF models on top of `llama.cpp`.
 
