@@ -11,6 +11,7 @@ import subprocess
 import sys
 import uuid
 from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -106,19 +107,277 @@ def env_path(name: str, default: str) -> Path:
         return path
     return (ENV_FILE_PATH.parent / path).resolve()
 
+
+def update_env_file_value(path: Path, key: str, value: str) -> None:
+    lines: list[str] = []
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    output: list[str] = []
+    replaced = False
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped and not stripped.startswith("#") and "=" in raw_line:
+            current_key = raw_line.split("=", 1)[0].strip()
+            if current_key == key:
+                output.append(f"{key}={value}")
+                replaced = True
+                continue
+        output.append(raw_line)
+
+    if not replaced:
+        output.append(f"{key}={value}")
+
+    path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+
+
+def resolve_model_candidate(raw_value: str | Path | None) -> Path | None:
+    if raw_value in (None, ""):
+        return None
+    try:
+        candidate = Path(str(raw_value)).expanduser()
+        if not candidate.is_absolute():
+            candidate = (PROJECT_ROOT / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+    except Exception:
+        return None
+    if candidate.is_file() and candidate.suffix.lower() == ".gguf":
+        return candidate
+    return None
+
+
+def iter_common_model_roots() -> list[Path]:
+    roots: list[Path] = []
+
+    env_root = os.getenv("MODEL_PATH", "").strip()
+    if env_root:
+        try:
+            env_path_candidate = Path(env_root).expanduser()
+            roots.append(env_path_candidate if env_path_candidate.is_absolute() else (PROJECT_ROOT / env_path_candidate))
+            roots.append((env_path_candidate.parent if env_path_candidate.is_absolute() else (PROJECT_ROOT / env_path_candidate).parent))
+        except Exception:
+            pass
+
+    selected_model = get_setting("selected_model_path", "")
+    if selected_model:
+        try:
+            selected_candidate = Path(selected_model).expanduser()
+            roots.append(selected_candidate if selected_candidate.is_absolute() else (PROJECT_ROOT / selected_candidate))
+            roots.append((selected_candidate.parent if selected_candidate.is_absolute() else (PROJECT_ROOT / selected_candidate).parent))
+        except Exception:
+            pass
+
+    roots.extend(
+        [
+            PROJECT_ROOT / "models",
+            PROJECT_ROOT,
+            PROJECT_ROOT.parent / "models",
+            Path.home() / "models",
+            Path.home() / "Downloads",
+            Path.home() / ".cache" / "huggingface",
+        ]
+    )
+    if os.name == "nt":
+        roots.append(Path("C:/Models"))
+    else:
+        roots.extend(
+            [
+                Path("/opt/models"),
+                Path("/srv/models"),
+                Path("/var/lib/models"),
+                Path("/usr/local/share/models"),
+            ]
+        )
+
+    unique_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            continue
+        marker = str(resolved).lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_roots.append(resolved)
+    return unique_roots
+
+
+def score_model_candidate(path: Path) -> tuple[int, int, int, str]:
+    name = path.name.lower()
+    score = 0
+    if name == "qwen3.5-35b-a3b-uncensored-hauhaucs-aggressive-q5_k_m.gguf":
+        score += 1000
+    if "qwen" in name:
+        score += 200
+    if "qwen3.5" in name or "qwen35" in name:
+        score += 120
+    if "instruct" in name:
+        score += 50
+    if "coder" in name:
+        score += 40
+    if "q5_k_m" in name:
+        score += 80
+    elif "q6_k" in name:
+        score += 70
+    elif "q4_k_m" in name:
+        score += 60
+    elif "bf16" in name:
+        score += 20
+    if "uncensored" in name:
+        score += 10
+
+    try:
+        stat = path.stat()
+        size = int(stat.st_size)
+        mtime = int(stat.st_mtime)
+    except OSError:
+        size = 0
+        mtime = 0
+
+    return score, size, mtime, name
+
+
+def model_identity_key(path: Path) -> str:
+    try:
+        return str(path.resolve()).lower()
+    except Exception:
+        return str(path).lower()
+
+
+def model_profile_for_path(model_path: Path) -> dict[str, Any]:
+    name = model_path.name.lower()
+
+    if "qwen" in name:
+        chat_format = "qwen"
+    elif any(marker in name for marker in ("mistral", "mixtral", "zephyr", "hermes", "openchat", "chatml")):
+        chat_format = "chatml"
+    else:
+        chat_format = ""
+
+    if any(marker in name for marker in ("coder", "code")):
+        max_tokens = 4096
+        temperature = 0.35
+    elif any(marker in name for marker in ("instruct", "chat", "assistant", "it", "qwen", "llama", "mistral", "mixtral", "deepseek", "gemma", "phi")):
+        max_tokens = 3072
+        temperature = 0.5
+    else:
+        max_tokens = 2048
+        temperature = 0.6
+
+    if any(marker in name for marker in ("70b", "72b", "32b", "35b", "34b", "30b", "27b")):
+        n_ctx = 32768
+    else:
+        n_ctx = 16384
+
+    return {
+        "chat_format": chat_format,
+        "n_ctx": n_ctx,
+        "max_tokens": max_tokens,
+        "brief_max_tokens": 240,
+        "temperature": temperature,
+        "top_p": 0.95,
+        "top_k": 20,
+        "repeat_penalty": 1.1,
+    }
+
+
+def find_external_model_path() -> Path | None:
+    best_match: Path | None = None
+    best_score: tuple[int, int, int, str] | None = None
+    seen_paths: set[str] = set()
+
+    for root in iter_common_model_roots():
+        if root.is_file() and root.suffix.lower() == ".gguf":
+            marker = model_identity_key(root)
+            if marker in seen_paths:
+                continue
+            seen_paths.add(marker)
+            score = score_model_candidate(root)
+            if best_score is None or score > best_score:
+                best_match = root
+                best_score = score
+            continue
+        if not root.is_dir():
+            continue
+
+        seen_files = 0
+        for candidate in root.rglob("*.gguf"):
+            seen_files += 1
+            if seen_files > 200:
+                break
+            marker = model_identity_key(candidate)
+            if marker in seen_paths:
+                continue
+            seen_paths.add(marker)
+            score = score_model_candidate(candidate)
+            if best_score is None or score > best_score:
+                best_match = candidate
+                best_score = score
+
+    return best_match
+
+
+def persist_model_path(model_path: Path) -> Path:
+    global MODEL_PATH
+    global MODEL_PROFILE
+
+    resolved = model_path.resolve()
+    MODEL_PATH = resolved
+    MODEL_PROFILE = model_profile_for_path(resolved)
+    os.environ["MODEL_PATH"] = str(resolved)
+    set_setting("selected_model_path", str(resolved))
+    try:
+        update_env_file_value(ENV_FILE_PATH, "MODEL_PATH", str(resolved))
+        update_env_file_value(ENV_FILE_PATH, "CHAT_FORMAT", str(MODEL_PROFILE["chat_format"]))
+        update_env_file_value(ENV_FILE_PATH, "N_CTX", str(MODEL_PROFILE["n_ctx"]))
+        update_env_file_value(ENV_FILE_PATH, "MAX_TOKENS", str(MODEL_PROFILE["max_tokens"]))
+        update_env_file_value(ENV_FILE_PATH, "BRIEF_MAX_TOKENS", str(MODEL_PROFILE["brief_max_tokens"]))
+        update_env_file_value(ENV_FILE_PATH, "TEMPERATURE", str(MODEL_PROFILE["temperature"]))
+        update_env_file_value(ENV_FILE_PATH, "TOP_P", str(MODEL_PROFILE["top_p"]))
+        update_env_file_value(ENV_FILE_PATH, "TOP_K", str(MODEL_PROFILE["top_k"]))
+        update_env_file_value(ENV_FILE_PATH, "REPEAT_PENALTY", str(MODEL_PROFILE["repeat_penalty"]))
+    except Exception:
+        logger.exception("Не удалось обновить параметры модели в .env")
+    return resolved
+
+
+def ensure_valid_model_path() -> Path:
+    candidate = resolve_model_candidate(MODEL_PATH)
+    if candidate is not None:
+        if candidate != MODEL_PATH:
+            return persist_model_path(candidate)
+        return candidate
+
+    db_candidate = resolve_model_candidate(get_setting("selected_model_path", ""))
+    if db_candidate is not None:
+        logger.warning("MODEL_PATH в .env битый. Подхватываю модель из базы: %s", db_candidate)
+        return persist_model_path(db_candidate)
+
+    discovered = find_external_model_path()
+    if discovered is not None:
+        logger.warning("MODEL_PATH в .env битый. Сам нашел живую модель: %s", discovered)
+        return persist_model_path(discovered)
+
+    raise RuntimeError(f"Не найден файл модели: {MODEL_PATH}")
+
 BOT_TOKEN = env_str("BOT_TOKEN")
 MODEL_PATH = env_path(
     "MODEL_PATH",
     get_setting("selected_model_path", "./models/model.gguf") or "./models/model.gguf",
 )
+MODEL_PROFILE = model_profile_for_path(MODEL_PATH)
 LLAMA_CPP_DIR = env_path("LLAMA_CPP_DIR", "./llama.cpp")
+LLAMA_SERVER_FILENAME = "llama-server.exe" if os.name == "nt" else "llama-server"
 LLAMA_SERVER_EXE = env_path(
     "LLAMA_SERVER_EXE",
-    str(LLAMA_CPP_DIR / "llama-server.exe"),
+    str(LLAMA_CPP_DIR / LLAMA_SERVER_FILENAME),
 )
 SOURCE_URL = env_str(
     "SOURCE_URL",
-    "https://github.com/AlbertGithot/Qwen3.5-Uncensored-But-On-TG-Bot.git",
+    "https://github.com/AlbertGithot/ai-to-tgbot-port",
 )
 LLAMA_SERVER_HOST = env_str("LLAMA_SERVER_HOST", "127.0.0.1")
 LLAMA_SERVER_PORT = env_int("LLAMA_SERVER_PORT", 8080)
@@ -130,6 +389,9 @@ LLAMA_SERVER_START_TIMEOUT = env_int("LLAMA_SERVER_START_TIMEOUT", 180)
 LLAMA_SERVER_REASONING = env_str("LLAMA_SERVER_REASONING", "off")
 LLAMA_SERVER_REASONING_BUDGET = env_int("LLAMA_SERVER_REASONING_BUDGET", 0)
 LLAMA_SERVER_REASONING_FORMAT = env_str("LLAMA_SERVER_REASONING_FORMAT", "deepseek")
+LLAMA_SERVER_AUTO_RESTART = env_bool("LLAMA_SERVER_AUTO_RESTART", True)
+LLAMA_SERVER_MAX_RESTART_ATTEMPTS = max(0, env_int("LLAMA_SERVER_MAX_RESTART_ATTEMPTS", 1))
+LLAMA_SERVER_RESTART_DELAY_SECONDS = max(1, env_int("LLAMA_SERVER_RESTART_DELAY_SECONDS", 2))
 
 SYSTEM_PROMPT = (
     "Ты локальный ассистент Telegram. "
@@ -141,7 +403,7 @@ SYSTEM_PROMPT = (
 
 # Если модель сама не подхватывает chat template из GGUF, впиши сюда формат
 # вроде 'chatml', 'llama-2', 'mistral-instruct' и т.д. Иначе оставь None.
-CHAT_FORMAT: str | None = env_str("CHAT_FORMAT", "qwen") or None
+CHAT_FORMAT: str | None = env_str("CHAT_FORMAT", str(MODEL_PROFILE["chat_format"])) or None
 
 MAX_HISTORY_MESSAGES = env_int("MAX_HISTORY_MESSAGES", 10)
 MAX_HISTORY_ENTRY_CHARS = env_int("MAX_HISTORY_ENTRY_CHARS", 2500)
@@ -151,17 +413,17 @@ MAX_MULTI_REQUEST_TEXT_CHARS = env_int("MAX_MULTI_REQUEST_TEXT_CHARS", 2000)
 MAX_LOG_TEXT_CHARS = env_int("MAX_LOG_TEXT_CHARS", 6000)
 MAX_MODEL_REPLY_CHARS = env_int("MAX_MODEL_REPLY_CHARS", 24000)
 
-N_CTX = env_int("N_CTX", 32768)
+N_CTX = env_int("N_CTX", int(MODEL_PROFILE["n_ctx"]))
 N_THREADS = max(1, (os.cpu_count() or 4) - 1)
 N_BATCH = env_int("N_BATCH", 512)
 N_GPU_LAYERS = env_int("N_GPU_LAYERS", 0)
 
-MAX_TOKENS = env_int("MAX_TOKENS", 3072)
-BRIEF_MAX_TOKENS = env_int("BRIEF_MAX_TOKENS", 240)
-TEMPERATURE = env_float("TEMPERATURE", 0.6)
-TOP_P = env_float("TOP_P", 0.95)
-TOP_K = env_int("TOP_K", 20)
-REPEAT_PENALTY = env_float("REPEAT_PENALTY", 1.1)
+MAX_TOKENS = env_int("MAX_TOKENS", int(MODEL_PROFILE["max_tokens"]))
+BRIEF_MAX_TOKENS = env_int("BRIEF_MAX_TOKENS", int(MODEL_PROFILE["brief_max_tokens"]))
+TEMPERATURE = env_float("TEMPERATURE", float(MODEL_PROFILE["temperature"]))
+TOP_P = env_float("TOP_P", float(MODEL_PROFILE["top_p"]))
+TOP_K = env_int("TOP_K", int(MODEL_PROFILE["top_k"]))
+REPEAT_PENALTY = env_float("REPEAT_PENALTY", float(MODEL_PROFILE["repeat_penalty"]))
 STOP_STRINGS = ["<|eot_id|>", "<|end|>", "</s>"]
 
 TELEGRAM_SEGMENT_LIMIT = env_int("TELEGRAM_SEGMENT_LIMIT", 3800)
@@ -240,6 +502,9 @@ bot_response_message_ids: dict[str, deque[int]] = {}
 dialog_prompt_snapshots: dict[str, str] = {}
 dialog_activity_order: OrderedDict[str, None] = OrderedDict()
 model_lock: asyncio.Lock | None = None
+model_pending_requests = 0
+model_active_request_label: str | None = None
+model_active_started_at: datetime | None = None
 LLAMA_SERVER_PROCESS: subprocess.Popen[str] | None = None
 LLAMA_SERVER_LOG_HANDLE: Any | None = None
 
@@ -337,7 +602,7 @@ def prune_dialog_state() -> None:
 def build_license_notice_text() -> str:
     return (
         "Перейдите на репозиторий разработчика и кликните по LICENSE - "
-        "https://github.com/AlbertGithot/Qwen3.5-Uncensored-But-On-TG-Bot.git"
+        "https://github.com/AlbertGithot/ai-to-tgbot-port"
     )
 
 
@@ -609,11 +874,10 @@ def validate_config() -> None:
     if not BOT_TOKEN or "PASTE_TELEGRAM_BOT_TOKEN_HERE" in BOT_TOKEN:
         raise RuntimeError("Вставь токен бота в BOT_TOKEN.")
 
-    if not MODEL_PATH.is_file():
-        raise RuntimeError(f"Не найден файл модели: {MODEL_PATH}")
+    ensure_valid_model_path()
 
     if not LLAMA_SERVER_EXE.is_file():
-        raise RuntimeError(f"Не найден llama-server.exe: {LLAMA_SERVER_EXE}")
+        raise RuntimeError(f"Не найден llama-server: {LLAMA_SERVER_EXE}")
 
 
 def get_dialog_key(message: Message) -> str:
@@ -683,6 +947,49 @@ def get_chat_lock(chat_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         chat_locks[chat_id] = lock
     return lock
+
+
+@asynccontextmanager
+async def acquire_model_slot(label: str):
+    global model_pending_requests
+    global model_active_request_label
+    global model_active_started_at
+
+    if model_lock is None:
+        raise RuntimeError("Лок модели не инициализирован.")
+
+    model_pending_requests += 1
+    queue_position = model_pending_requests
+    acquired = False
+
+    try:
+        await model_lock.acquire()
+        acquired = True
+        model_pending_requests = max(0, model_pending_requests - 1)
+        model_active_request_label = label
+        model_active_started_at = datetime.now()
+        try:
+            yield queue_position
+        finally:
+            model_active_request_label = None
+            model_active_started_at = None
+            model_lock.release()
+    finally:
+        if not acquired:
+            model_pending_requests = max(0, model_pending_requests - 1)
+
+
+def get_model_runtime_snapshot() -> dict[str, Any]:
+    active_for_seconds: int | None = None
+    if model_active_started_at is not None:
+        active_for_seconds = max(
+            0, int((datetime.now() - model_active_started_at).total_seconds())
+        )
+    return {
+        "pending_requests": model_pending_requests,
+        "active_label": model_active_request_label,
+        "active_for_seconds": active_for_seconds,
+    }
 
 
 def user_payload(message: Message) -> dict[str, Any]:
@@ -934,35 +1241,6 @@ def reset_dialog(dialog_key: str) -> None:
     dialog_activity_order.pop(dialog_key, None)
 
 
-def build_llama_server_command() -> list[str]:
-    return [
-        str(LLAMA_SERVER_EXE),
-        "--model",
-        str(MODEL_PATH),
-        "--host",
-        LLAMA_SERVER_HOST,
-        "--port",
-        str(LLAMA_SERVER_PORT),
-        "--ctx-size",
-        str(N_CTX),
-        "--threads",
-        str(N_THREADS),
-        "--threads-batch",
-        str(N_THREADS),
-        "--batch-size",
-        str(N_BATCH),
-        "--jinja",
-        "--reasoning",
-        LLAMA_SERVER_REASONING,
-        "--reasoning-budget",
-        str(LLAMA_SERVER_REASONING_BUDGET),
-        "--reasoning-format",
-        LLAMA_SERVER_REASONING_FORMAT,
-        "--n-gpu-layers",
-        str(N_GPU_LAYERS),
-    ]
-
-
 async def is_llama_server_ready() -> bool:
     timeout = aiohttp.ClientTimeout(total=3)
     try:
@@ -1000,12 +1278,53 @@ def start_llama_server() -> None:
     )
 
 
+def get_llama_server_process_state() -> dict[str, Any]:
+    process = LLAMA_SERVER_PROCESS
+    if process is None:
+        return {"state": "stopped", "pid": None, "exit_code": None}
+    exit_code = process.poll()
+    if exit_code is None:
+        return {"state": "running", "pid": process.pid, "exit_code": None}
+    return {"state": "exited", "pid": process.pid, "exit_code": exit_code}
+
+
+def build_llama_server_command() -> list[str]:
+    model_path = ensure_valid_model_path()
+    return [
+        str(LLAMA_SERVER_EXE),
+        "--model",
+        str(model_path),
+        "--host",
+        LLAMA_SERVER_HOST,
+        "--port",
+        str(LLAMA_SERVER_PORT),
+        "--ctx-size",
+        str(N_CTX),
+        "--threads",
+        str(N_THREADS),
+        "--threads-batch",
+        str(N_THREADS),
+        "--batch-size",
+        str(N_BATCH),
+        "--jinja",
+        "--reasoning",
+        LLAMA_SERVER_REASONING,
+        "--reasoning-budget",
+        str(LLAMA_SERVER_REASONING_BUDGET),
+        "--reasoning-format",
+        LLAMA_SERVER_REASONING_FORMAT,
+        "--n-gpu-layers",
+        str(N_GPU_LAYERS),
+    ]
+
+
 async def ensure_llama_server_running() -> None:
     if await is_llama_server_ready():
         logger.info("Использую уже запущенный llama-server: %s", LLAMA_SERVER_BASE_URL)
         return
 
-    logger.info("Запуск локального llama-server для модели: %s", MODEL_PATH)
+    model_path = ensure_valid_model_path()
+    logger.info("Запуск локального llama-server для модели: %s", model_path)
     start_llama_server()
 
     loop = asyncio.get_running_loop()
@@ -1044,6 +1363,69 @@ def stop_llama_server() -> None:
     if LLAMA_SERVER_LOG_HANDLE is not None:
         LLAMA_SERVER_LOG_HANDLE.close()
         LLAMA_SERVER_LOG_HANDLE = None
+
+
+async def restart_llama_server(reason: str) -> None:
+    logger.warning("Перезапускаю llama-server: %s", reason)
+    stop_llama_server()
+    await asyncio.sleep(LLAMA_SERVER_RESTART_DELAY_SECONDS)
+    await ensure_llama_server_running()
+
+
+def is_retryable_llama_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "не поднялся",
+        "завершился с кодом",
+        "cannot connect",
+        "server disconnected",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+    )
+    return any(marker in text for marker in markers)
+
+
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "нет"
+    minutes, secs = divmod(max(0, seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}ч {minutes}м {secs}с"
+    if minutes:
+        return f"{minutes}м {secs}с"
+    return f"{secs}с"
+
+
+async def build_runtime_status_text() -> str:
+    model_path_error: str | None = None
+    try:
+        model_path = ensure_valid_model_path()
+    except Exception as exc:
+        model_path = MODEL_PATH
+        model_path_error = str(exc)
+    ready = await is_llama_server_ready()
+    process_state = get_llama_server_process_state()
+    queue_state = get_model_runtime_snapshot()
+
+    lines = [
+        "Статус системы:",
+        f"AI: {'включен' if is_ai_enabled() else 'выключен'}",
+        f"llama-server API: {'доступен' if ready else 'недоступен'}",
+        f"llama-server процесс: {process_state['state']}",
+        f"PID: {process_state['pid'] or '-'}",
+        f"Код выхода: {process_state['exit_code'] if process_state['exit_code'] is not None else '-'}",
+        f"Модель: {model_path.name}",
+        f"MODEL_PATH: {model_path}",
+        f"Ожидают в очереди: {queue_state['pending_requests']}",
+        f"Активный запрос: {queue_state['active_label'] or '-'}",
+        f"Длительность активного запроса: {format_duration(queue_state['active_for_seconds'])}",
+        f"Историй в памяти: {len(dialog_histories)}",
+    ]
+    if model_path_error:
+        lines.append(f"Ошибка модели: {model_path_error}")
+    return "\n".join(lines)
 
 
 def extract_delta_text(chunk: dict[str, Any]) -> str:
@@ -1661,6 +2043,50 @@ async def stream_model_reply(messages: list[dict[str, str]], max_tokens: int) ->
     yield {"type": "done", "finish_reason": finish_reason}
 
 
+async def stream_model_reply_resilient(
+    messages: list[dict[str, str]],
+    max_tokens: int,
+) -> Any:
+    if not is_ai_enabled():
+        raise RuntimeError("ИИ выключен через панель управления.")
+
+    max_attempts = 1 + (
+        LLAMA_SERVER_MAX_RESTART_ATTEMPTS if LLAMA_SERVER_AUTO_RESTART else 0
+    )
+    last_error: BaseException | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async for event in stream_model_reply(messages, max_tokens):
+                yield event
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                raise RuntimeError(f"Ошибка соединения с llama-server: {exc}") from exc
+            logger.warning(
+                "Сбой потока llama-server, пробую перезапуск: attempt=%s/%s error=%s",
+                attempt,
+                max_attempts,
+                exc,
+            )
+            await restart_llama_server(f"stream error: {exc}")
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt >= max_attempts or not is_retryable_llama_error(exc):
+                raise
+            logger.warning(
+                "Retry после ошибки llama-server: attempt=%s/%s error=%s",
+                attempt,
+                max_attempts,
+                exc,
+            )
+            await restart_llama_server(str(exc))
+
+    if last_error is not None:
+        raise RuntimeError(str(last_error))
+
+
 async def collect_model_reply_unlocked(
     messages: list[dict[str, str]],
     max_tokens: int,
@@ -1670,7 +2096,7 @@ async def collect_model_reply_unlocked(
     raw_reply = ""
     finish_reason: str | None = None
 
-    async for event in stream_model_reply(messages, max_tokens):
+    async for event in stream_model_reply_resilient(messages, max_tokens):
         if event["type"] == "done":
             finish_reason = event.get("finish_reason")
             continue
@@ -1698,7 +2124,7 @@ async def collect_model_reply(
     if model_lock is None:
         raise RuntimeError("Лок модели не инициализирован.")
 
-    async with model_lock:
+    async with acquire_model_slot("collect"):
         return await collect_model_reply_unlocked(
             messages, max_tokens, brief_mode=brief_mode
         )
@@ -1809,6 +2235,7 @@ async def handle_start(message: Message) -> None:
         "Бот запущен. Пиши текст.\n"
         "/reset - сбросить память диалога.\n"
         "/ineedmore - собрать несколько запросов в один пакет.\n"
+        "/status - показать статус бота, модели и llama-server.\n"
         "/license - показать лицензию GNU AGPLv3.\n"
         "/source - показать ссылку на исходный код.",
         reply_markup=build_start_keyboard(),
@@ -1844,6 +2271,14 @@ async def handle_source(message: Message) -> None:
         else "SOURCE_URL не задан. Укажи ссылку на репозиторий в переменной окружения."
     )
     sent = await message.answer(text)
+    track_bot_message(get_dialog_key(message), sent)
+
+
+@router.message(Command("status"))
+async def handle_status(message: Message) -> None:
+    if await reject_if_blocked_message(message):
+        return
+    sent = await message.answer(await build_runtime_status_text())
     track_bot_message(get_dialog_key(message), sent)
 
 
@@ -1977,7 +2412,7 @@ async def process_multi_request(
         if model_lock is None:
             raise RuntimeError("Лок модели не инициализирован.")
 
-        async with model_lock:
+        async with acquire_model_slot(f"ineedmore:{status_message.chat.id}:{index}"):
             statuses[index] = "thinking"
             await refresh_status()
             reply, raw_reply, _ = await collect_model_reply_unlocked(messages, INEEDMORE_ITEM_MAX_TOKENS)
@@ -2337,8 +2772,8 @@ async def handle_text(message: Message, bot: Bot) -> None:
                 if model_lock is None:
                     raise RuntimeError("Лок модели не инициализирован.")
 
-                async with model_lock:
-                    async for event in stream_model_reply(messages, request_max_tokens):
+                async with acquire_model_slot(f"chat:{message.chat.id}"):
+                    async for event in stream_model_reply_resilient(messages, request_max_tokens):
                         if event["type"] == "done":
                             reply_finish_reason = event.get("finish_reason")
                             continue
@@ -2395,7 +2830,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
                         retry_raw_reply = ""
                         retry_messages = build_brief_retry_messages(text)
 
-                        async for event in stream_model_reply(retry_messages, request_max_tokens):
+                        async for event in stream_model_reply_resilient(retry_messages, request_max_tokens):
                             if event["type"] == "done":
                                 continue
                             retry_raw_reply, truncated = append_reply_chunk(
@@ -2432,7 +2867,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
                         repair_raw_reply = ""
                         repair_messages = build_repair_messages(dialog_key, text)
 
-                        async for event in stream_model_reply(repair_messages, request_max_tokens):
+                        async for event in stream_model_reply_resilient(repair_messages, request_max_tokens):
                             if event["type"] == "done":
                                 continue
                             repair_raw_reply, truncated = append_reply_chunk(
@@ -2556,6 +2991,7 @@ async def bot_worker_main() -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
 
+    await ensure_llama_server_running()
     logger.info("Бот запущен и готов к polling.")
     try:
         await dispatcher.start_polling(
