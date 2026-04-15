@@ -36,7 +36,6 @@ RECOMMENDED_MODEL_REPO = "HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressiv
 RECOMMENDED_MODEL_FILE = "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf"
 LLAMA_RELEASE_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 BOT_ENTRYPOINT = "bot.py"
-PACKAGE_SUBDIR = "windows"
 LAUNCHER_EXE_NAME = "HeyMate.exe"
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 UI_STEP_DELAY_SECONDS = 1.0
@@ -144,11 +143,8 @@ def resolve_state_install_root(raw_value: Any) -> Path | None:
         candidate = Path(str(raw_value)).expanduser().resolve()
     except Exception:
         return None
-    package_candidate = candidate / PACKAGE_SUBDIR
     if candidate.is_dir() and (candidate / BOT_ENTRYPOINT).is_file():
         return candidate
-    if package_candidate.is_dir() and (package_candidate / BOT_ENTRYPOINT).is_file():
-        return package_candidate
     return None
 
 
@@ -271,10 +267,6 @@ def current_launcher_path() -> Path:
 
 def resolve_project_root() -> Path:
     return current_launcher_path().parent
-
-
-def resolve_repo_package_root(repo_root: Path) -> Path:
-    return repo_root / PACKAGE_SUBDIR
 
 
 def python_command() -> list[str]:
@@ -481,10 +473,6 @@ def clone_or_download_repo(target_dir: Path) -> Path:
     if (target_dir / BOT_ENTRYPOINT).is_file():
         return target_dir
 
-    package_root = resolve_repo_package_root(target_dir)
-    if (package_root / BOT_ENTRYPOINT).is_file():
-        return package_root
-
     if target_dir.exists() and any(target_dir.iterdir()):
         reinstall = prompt_choice(
             "Папка для установки уже существует, но это не готовый проект. Что делаем?",
@@ -501,10 +489,9 @@ def clone_or_download_repo(target_dir: Path) -> Path:
 
     if git_available():
         run_command(["git", "clone", REPO_URL, str(target_dir)])
-        package_root = resolve_repo_package_root(target_dir)
-        if not (package_root / BOT_ENTRYPOINT).is_file():
-            raise RuntimeError("Репозиторий скачался, но пакет windows/bot.py не найден.")
-        return package_root
+        if not (target_dir / BOT_ENTRYPOINT).is_file():
+            raise RuntimeError("Репозиторий скачался, но bot.py в корне не найден.")
+        return target_dir
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
@@ -517,10 +504,9 @@ def clone_or_download_repo(target_dir: Path) -> Path:
         source_root = extracted_roots[0]
         shutil.copytree(source_root, target_dir, dirs_exist_ok=True)
 
-    package_root = resolve_repo_package_root(target_dir)
-    if not (package_root / BOT_ENTRYPOINT).is_file():
-        raise RuntimeError("Репозиторий распакован, но пакет windows/bot.py не найден.")
-    return package_root
+    if not (target_dir / BOT_ENTRYPOINT).is_file():
+        raise RuntimeError("Репозиторий распакован, но bot.py в корне не найден.")
+    return target_dir
 
 
 def find_llama_server_exe(root: Path) -> Path | None:
