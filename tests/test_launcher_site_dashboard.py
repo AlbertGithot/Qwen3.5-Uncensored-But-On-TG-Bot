@@ -31,7 +31,30 @@ class LauncherSiteDashboardTests(unittest.TestCase):
         self.assertEqual(settings["host"], "0.0.0.0")
         self.assertEqual(settings["port"], 6060)
         self.assertEqual(settings["refresh_seconds"], 9)
-        self.assertEqual(settings["url"], "http://127.0.0.1:6060")
+        self.assertEqual(settings["listen_url"], "http://0.0.0.0:6060")
+
+    def test_load_site_dashboard_settings_prefers_server_ip_for_external_access(self) -> None:
+        (self.project_root / launcher_cli.ENV_FILE_NAME).write_text(
+            "SITE_DASHBOARD_HOST=0.0.0.0\nSITE_DASHBOARD_PORT=5080\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {"SSH_CONNECTION": "203.0.113.10 51422 45.93.200.129 22"},
+            clear=False,
+        ), mock.patch(
+            "launcher_cli.run_capture_command",
+            return_value=None,
+        ), mock.patch(
+            "launcher_cli.socket.getaddrinfo",
+            return_value=[],
+        ):
+            settings = launcher_cli.load_site_dashboard_settings(self.project_root)
+
+        self.assertEqual(settings["listen_url"], "http://0.0.0.0:5080")
+        self.assertEqual(settings["url"], "http://45.93.200.129:5080")
+        self.assertIn("http://45.93.200.129:5080", settings["access_urls"])
 
     def test_extract_site_dashboard_access_code_reads_first_launch_log(self) -> None:
         log_text = (

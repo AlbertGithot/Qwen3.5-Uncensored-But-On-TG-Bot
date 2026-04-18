@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import ipaddress
 import itertools
 import json
 import locale
@@ -8,6 +9,7 @@ import os
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -654,6 +656,71 @@ def coerce_site_dashboard_refresh_seconds(raw_value: Any) -> int:
     return max(2, value)
 
 
+def normalize_network_host_candidate(raw_value: Any) -> str:
+    text = str(raw_value or "").strip()
+    if not text:
+        return ""
+    text = text.strip("[]")
+    try:
+        candidate_ip = ipaddress.ip_address(text)
+    except ValueError:
+        return ""
+    if candidate_ip.is_loopback or candidate_ip.is_unspecified or candidate_ip.is_multicast or candidate_ip.is_link_local:
+        return ""
+    return candidate_ip.compressed
+
+
+def format_http_url(host: str, port: int) -> str:
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return f"http://{host}:{port}"
+    if parsed.version == 6:
+        return f"http://[{parsed.compressed}]:{port}"
+    return f"http://{parsed.compressed}:{port}"
+
+
+def collect_site_dashboard_access_hosts(public_host_override: str = "") -> list[str]:
+    hosts: list[str] = []
+    seen: set[str] = set()
+
+    def add_host(candidate: Any) -> None:
+        normalized = normalize_network_host_candidate(candidate)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        hosts.append(normalized)
+
+    add_host(public_host_override)
+
+    ssh_connection = os.getenv("SSH_CONNECTION", "").strip()
+    if ssh_connection:
+        ssh_parts = ssh_connection.split()
+        if len(ssh_parts) >= 4:
+            add_host(ssh_parts[2])
+
+    hostname_i = run_capture_command(["hostname", "-I"], timeout=5)
+    if hostname_i is not None and hostname_i.returncode == 0:
+        for token in (hostname_i.stdout or "").split():
+            add_host(token)
+
+    ip_addr = run_capture_command(["ip", "-o", "-4", "addr", "show", "scope", "global"], timeout=5)
+    if ip_addr is not None and ip_addr.returncode == 0:
+        for raw_line in (ip_addr.stdout or "").splitlines():
+            parts = raw_line.split()
+            if len(parts) >= 4 and "/" in parts[3]:
+                add_host(parts[3].split("/", 1)[0])
+
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(socket.gethostname(), None):
+            if family == socket.AF_INET and sockaddr:
+                add_host(sockaddr[0])
+    except Exception:
+        pass
+
+    return hosts
+
+
 def load_site_dashboard_settings(project_root: Path) -> dict[str, Any]:
     env_values = parse_env_file(project_root / ENV_FILE_NAME)
     host = str(
@@ -661,6 +728,11 @@ def load_site_dashboard_settings(project_root: Path) -> dict[str, Any]:
         or os.getenv("SITE_DASHBOARD_HOST")
         or SITE_DASHBOARD_DEFAULT_HOST
     ).strip() or SITE_DASHBOARD_DEFAULT_HOST
+    public_host_override = str(
+        env_values.get("SITE_DASHBOARD_PUBLIC_HOST")
+        or os.getenv("SITE_DASHBOARD_PUBLIC_HOST")
+        or ""
+    ).strip()
     port = coerce_site_dashboard_port(
         env_values.get("SITE_DASHBOARD_PORT")
         or os.getenv("SITE_DASHBOARD_PORT")
@@ -671,13 +743,23 @@ def load_site_dashboard_settings(project_root: Path) -> dict[str, Any]:
         or os.getenv("SITE_DASHBOARD_REFRESH_SECONDS")
         or SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS
     )
-    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    listen_url = format_http_url(host, port)
+    if host in {"0.0.0.0", "::"}:
+        access_hosts = collect_site_dashboard_access_hosts(public_host_override)
+        if not access_hosts:
+            access_hosts = ["127.0.0.1"]
+    else:
+        access_hosts = [public_host_override or host]
+    access_urls = [format_http_url(candidate_host, port) for candidate_host in access_hosts]
     return {
         "host": host,
+        "public_host_override": public_host_override,
         "port": port,
         "refresh_seconds": refresh_seconds,
-        "display_host": display_host,
-        "url": f"http://{display_host}:{port}",
+        "listen_url": listen_url,
+        "access_hosts": access_hosts,
+        "access_urls": access_urls,
+        "url": access_urls[0],
     }
 
 
@@ -793,14 +875,26 @@ def get_site_dashboard_status(project_root: Path, *, cleanup_stale: bool = True)
 def show_site_dashboard_status(project_root: Path) -> None:
     cls()
     status = get_site_dashboard_status(project_root)
+    access_urls = status.get("access_urls") or [status["url"]]
     print(
         f"Статус веб-панели: {'работает' if status['running'] else 'остановлена'}\n"
-        f"URL: {status['url']}\n"
+        f"Слушает: {status['listen_url']}\n"
+        f"Заходить можно по: {access_urls[0]}\n"
         f"PID: {status.get('pid') or '-'}\n"
         f"Runtime: {status['state_path']}\n"
         f"Лог: {status['log_path']}\n",
         flush=True,
     )
+    if len(access_urls) > 1:
+        print("Другие найденные адреса входа:", flush=True)
+        for url in access_urls[1:]:
+            print(f"- {url}", flush=True)
+        print("", flush=True)
+    if status["host"] in {"127.0.0.1", "::1", "localhost"}:
+        print(
+            "Сейчас панель привязана только к loopback. Чтобы зайти по IP сервера, выставь SITE_DASHBOARD_HOST=0.0.0.0.\n",
+            flush=True,
+        )
     if status["running"] and status["recovered"]:
         print("Процесс нашёл по `ps` и снова привязал к лаунчеру. Хоть кто-то тут умеет чинить бардак автоматически.\n", flush=True)
     pause()
@@ -834,12 +928,19 @@ def open_site_dashboard_in_browser(project_root: Path) -> None:
 def launch_site_dashboard(project_root: Path, *, open_browser: bool = False) -> None:
     cls()
     status = get_site_dashboard_status(project_root)
+    access_urls = status.get("access_urls") or [status["url"]]
     if status["running"]:
         print(
-            f"Веб-панель уже крутится: {status['url']} (PID {status['pid']}).\n"
+            f"Веб-панель уже крутится: {access_urls[0]} (PID {status['pid']}).\n"
+            f"Слушает: {status['listen_url']}\n"
             f"Лог: {status['log_path']}\n",
             flush=True,
         )
+        if len(access_urls) > 1:
+            print("Другие адреса входа:", flush=True)
+            for url in access_urls[1:]:
+                print(f"- {url}", flush=True)
+            print("", flush=True)
         if open_browser:
             open_site_dashboard_in_browser(project_root)
             return
@@ -889,14 +990,21 @@ def launch_site_dashboard(project_root: Path, *, open_browser: bool = False) -> 
 
     log_tail = read_text_tail(log_path, max_chars=4000)
     access_code = extract_site_dashboard_access_code(log_tail)
+    access_urls = settings.get("access_urls") or [settings["url"]]
     print(
         f"Веб-панель поднял в фоне.\n"
-        f"URL: {settings['url']}\n"
+        f"Слушает: {settings['listen_url']}\n"
+        f"Заходить можно по: {access_urls[0]}\n"
         f"PID: {process.pid}\n"
         f"Runtime: {state_path}\n"
         f"Лог: {log_path}\n",
         flush=True,
     )
+    if len(access_urls) > 1:
+        print("Другие адреса входа:", flush=True)
+        for url in access_urls[1:]:
+            print(f"- {url}", flush=True)
+        print("", flush=True)
     if first_launch:
         if access_code:
             print(f"Код доступа первого запуска: {access_code}\n", flush=True)
@@ -996,7 +1104,18 @@ def install_site_dashboard_systemd_service(project_root: Path) -> None:
         return
 
     print(f"Service веб-панели установлен: {service_path}", flush=True)
-    print(f"Панель должна жить тут: {load_site_dashboard_settings(project_root)['url']}\n", flush=True)
+    settings = load_site_dashboard_settings(project_root)
+    access_urls = settings.get("access_urls") or [settings["url"]]
+    print(
+        f"Панель слушает: {settings['listen_url']}\n"
+        f"Заходить можно по: {access_urls[0]}\n",
+        flush=True,
+    )
+    if len(access_urls) > 1:
+        print("Другие адреса входа:", flush=True)
+        for url in access_urls[1:]:
+            print(f"- {url}", flush=True)
+        print("", flush=True)
     if mode == "user":
         print(
             "Если это headless Linux-сервер, может понадобиться loginctl enable-linger $USER.\n",
@@ -4034,11 +4153,13 @@ def site_dashboard_menu(project_root: Path) -> None:
     while True:
         cls()
         status = get_site_dashboard_status(project_root)
+        access_urls = status.get("access_urls") or [status["url"]]
         print_block(
             f"""
             Веб-панель управления всем этим хозяйством.
             Сейчас она {'работает' if status['running'] else 'остановлена'}.
-            URL: {status['url']}
+            Слушает: {status['listen_url']}
+            Адрес входа: {access_urls[0]}
             PID: {status.get('pid') or '-'}
             """
         )
