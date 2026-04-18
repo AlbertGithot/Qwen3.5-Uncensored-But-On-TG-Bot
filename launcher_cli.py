@@ -6,6 +6,7 @@ import json
 import locale
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import textwrap
 import time
 import urllib.parse
 import urllib.request
+import webbrowser
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -33,9 +35,17 @@ RECOMMENDED_MODEL_REPO = "HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressiv
 RECOMMENDED_MODEL_FILE = "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf"
 LLAMA_RELEASE_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 BOT_ENTRYPOINT = "bot.py"
+SITE_DASHBOARD_ENTRYPOINT = "site_dashboard.py"
 UI_STEP_DELAY_SECONDS = 1.0
 SYSTEMD_SERVICE_NAME = "heymate-bot.service"
 TERMINAL_SESSIONS_DIR_NAME = "terminal_sessions"
+SITE_DASHBOARD_RUNTIME_DIR_NAME = "web_panel_runtime"
+SITE_DASHBOARD_STATE_FILE_NAME = "panel_state.json"
+SITE_DASHBOARD_PROCESS_FILE_NAME = "site_dashboard_process.json"
+SITE_DASHBOARD_LOG_FILE_NAME = "site_dashboard.log"
+SITE_DASHBOARD_DEFAULT_HOST = "0.0.0.0"
+SITE_DASHBOARD_DEFAULT_PORT = 5080
+SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS = 4
 GIT_REMOTE_NAME = "origin"
 UPDATE_CHECK_TIMEOUT_SECONDS = 20
 LIVE_STATUS_BAR_WIDTH = 22
@@ -591,6 +601,353 @@ def read_text_tail(path: Path, max_chars: int = LOG_PREVIEW_CHARS) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")[-max_chars:].strip() or "Лог пуст."
 
 
+def site_dashboard_runtime_root(project_root: Path) -> Path:
+    return project_root / SITE_DASHBOARD_RUNTIME_DIR_NAME
+
+
+def site_dashboard_state_path(project_root: Path) -> Path:
+    return site_dashboard_runtime_root(project_root) / SITE_DASHBOARD_STATE_FILE_NAME
+
+
+def site_dashboard_process_state_path(project_root: Path) -> Path:
+    return site_dashboard_runtime_root(project_root) / SITE_DASHBOARD_PROCESS_FILE_NAME
+
+
+def site_dashboard_log_path(project_root: Path) -> Path:
+    return site_dashboard_runtime_root(project_root) / SITE_DASHBOARD_LOG_FILE_NAME
+
+
+def coerce_site_dashboard_port(raw_value: Any) -> int:
+    try:
+        port = int(str(raw_value or "").strip())
+    except (TypeError, ValueError):
+        return SITE_DASHBOARD_DEFAULT_PORT
+    return port if 1 <= port <= 65535 else SITE_DASHBOARD_DEFAULT_PORT
+
+
+def coerce_site_dashboard_refresh_seconds(raw_value: Any) -> int:
+    try:
+        value = int(str(raw_value or "").strip())
+    except (TypeError, ValueError):
+        return SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS
+    return max(2, value)
+
+
+def load_site_dashboard_settings(project_root: Path) -> dict[str, Any]:
+    env_values = parse_env_file(project_root / ENV_FILE_NAME)
+    host = str(
+        env_values.get("SITE_DASHBOARD_HOST")
+        or os.getenv("SITE_DASHBOARD_HOST")
+        or SITE_DASHBOARD_DEFAULT_HOST
+    ).strip() or SITE_DASHBOARD_DEFAULT_HOST
+    port = coerce_site_dashboard_port(
+        env_values.get("SITE_DASHBOARD_PORT")
+        or os.getenv("SITE_DASHBOARD_PORT")
+        or SITE_DASHBOARD_DEFAULT_PORT
+    )
+    refresh_seconds = coerce_site_dashboard_refresh_seconds(
+        env_values.get("SITE_DASHBOARD_REFRESH_SECONDS")
+        or os.getenv("SITE_DASHBOARD_REFRESH_SECONDS")
+        or SITE_DASHBOARD_DEFAULT_REFRESH_SECONDS
+    )
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return {
+        "host": host,
+        "port": port,
+        "refresh_seconds": refresh_seconds,
+        "display_host": display_host,
+        "url": f"http://{display_host}:{port}",
+    }
+
+
+def build_site_dashboard_launch_env(project_root: Path) -> dict[str, str]:
+    settings = load_site_dashboard_settings(project_root)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["SITE_DASHBOARD_HOST"] = str(settings["host"])
+    env["SITE_DASHBOARD_PORT"] = str(settings["port"])
+    env["SITE_DASHBOARD_REFRESH_SECONDS"] = str(settings["refresh_seconds"])
+    return env
+
+
+def extract_site_dashboard_access_code(log_text: str) -> str:
+    match = re.search(r"Код доступа создан:\s*([^\s]+)", str(log_text or ""))
+    return match.group(1).strip() if match else ""
+
+
+def read_process_command(pid: int) -> str:
+    if pid < 1:
+        return ""
+    completed = run_capture_command(["ps", "-p", str(pid), "-o", "command="], timeout=5)
+    if completed is None or completed.returncode != 0:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def find_running_site_dashboard_process(project_root: Path) -> dict[str, Any] | None:
+    completed = run_capture_command(["ps", "-axo", "pid=,command="], timeout=5)
+    if completed is None or completed.returncode != 0:
+        return None
+
+    project_marker = str(project_root.resolve())
+    for raw_line in (completed.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, command = parts
+        if not pid_text.isdigit():
+            continue
+        if SITE_DASHBOARD_ENTRYPOINT not in command:
+            continue
+        if project_marker not in command:
+            continue
+        return {"pid": int(pid_text), "command": command}
+    return None
+
+
+def get_site_dashboard_status(project_root: Path, *, cleanup_stale: bool = True) -> dict[str, Any]:
+    settings = load_site_dashboard_settings(project_root)
+    process_state = load_json(site_dashboard_process_state_path(project_root))
+    pid = parse_positive_int(process_state.get("pid"))
+    command = ""
+    if pid is not None:
+        command = read_process_command(pid)
+        if command and SITE_DASHBOARD_ENTRYPOINT in command and str(project_root.resolve()) in command:
+            return {
+                **settings,
+                "running": True,
+                "pid": pid,
+                "command": command,
+                "log_path": site_dashboard_log_path(project_root),
+                "state_path": site_dashboard_state_path(project_root),
+                "process_state_path": site_dashboard_process_state_path(project_root),
+                "recovered": False,
+            }
+
+    recovered = find_running_site_dashboard_process(project_root)
+    if recovered is not None:
+        process_payload = {
+            "pid": int(recovered["pid"]),
+            "host": settings["host"],
+            "port": settings["port"],
+            "url": settings["url"],
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        process_state_path = site_dashboard_process_state_path(project_root)
+        process_state_path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(process_state_path, process_payload)
+        return {
+            **settings,
+            "running": True,
+            "pid": int(recovered["pid"]),
+            "command": str(recovered.get("command") or ""),
+            "log_path": site_dashboard_log_path(project_root),
+            "state_path": site_dashboard_state_path(project_root),
+            "process_state_path": process_state_path,
+            "recovered": True,
+        }
+
+    process_state_path = site_dashboard_process_state_path(project_root)
+    if cleanup_stale and process_state_path.is_file():
+        try:
+            process_state_path.unlink()
+        except OSError:
+            pass
+
+    return {
+        **settings,
+        "running": False,
+        "pid": pid,
+        "command": command,
+        "log_path": site_dashboard_log_path(project_root),
+        "state_path": site_dashboard_state_path(project_root),
+        "process_state_path": process_state_path,
+        "recovered": False,
+    }
+
+
+def show_site_dashboard_status(project_root: Path) -> None:
+    cls()
+    status = get_site_dashboard_status(project_root)
+    print(
+        f"Статус веб-панели: {'работает' if status['running'] else 'остановлена'}\n"
+        f"URL: {status['url']}\n"
+        f"PID: {status.get('pid') or '-'}\n"
+        f"Runtime: {status['state_path']}\n"
+        f"Лог: {status['log_path']}\n",
+        flush=True,
+    )
+    if status["running"] and status["recovered"]:
+        print("Процесс нашёл по `ps` и снова привязал к лаунчеру. Хоть кто-то тут умеет чинить бардак автоматически.\n", flush=True)
+    pause()
+
+
+def open_site_dashboard_in_browser(project_root: Path) -> None:
+    cls()
+    status = get_site_dashboard_status(project_root)
+    if not status["running"]:
+        print("Веб-панель пока не запущена. Сначала подними её, а потом уже зови браузер на работу.\n", flush=True)
+        pause()
+        return
+
+    opened = False
+    try:
+        opened = bool(webbrowser.open(status["url"], new=2))
+    except Exception:
+        opened = False
+
+    if opened:
+        print(f"Открыл панель в браузере: {status['url']}\n", flush=True)
+    else:
+        print(
+            f"Браузер сам не стартанул. Открой руками: {status['url']}\n"
+            "Да, иногда автоматизация тоже уходит в эмоциональный отпуск.\n",
+            flush=True,
+        )
+    pause()
+
+
+def launch_site_dashboard(project_root: Path, *, open_browser: bool = False) -> None:
+    cls()
+    status = get_site_dashboard_status(project_root)
+    if status["running"]:
+        print(
+            f"Веб-панель уже крутится: {status['url']} (PID {status['pid']}).\n"
+            f"Лог: {status['log_path']}\n",
+            flush=True,
+        )
+        if open_browser:
+            open_site_dashboard_in_browser(project_root)
+            return
+        pause()
+        return
+
+    ensure_python_dependencies(project_root)
+    settings = load_site_dashboard_settings(project_root)
+    runtime_root = site_dashboard_runtime_root(project_root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    log_path = site_dashboard_log_path(project_root)
+    state_path = site_dashboard_state_path(project_root)
+    first_launch = not state_path.is_file()
+    command = [*python_command(), str(project_root / SITE_DASHBOARD_ENTRYPOINT)]
+    launch_env = build_site_dashboard_launch_env(project_root)
+
+    with log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(project_root),
+            env=launch_env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    time.sleep(1.2)
+    if process.poll() is not None:
+        print("Веб-панель рухнула почти сразу после старта. Лови хвост лога ниже.\n", flush=True)
+        print(read_text_tail(log_path), flush=True)
+        pause()
+        return
+
+    process_state_path = site_dashboard_process_state_path(project_root)
+    process_state_path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(
+        process_state_path,
+        {
+            "pid": process.pid,
+            "host": settings["host"],
+            "port": settings["port"],
+            "url": settings["url"],
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+    )
+
+    log_tail = read_text_tail(log_path, max_chars=4000)
+    access_code = extract_site_dashboard_access_code(log_tail)
+    print(
+        f"Веб-панель поднял в фоне.\n"
+        f"URL: {settings['url']}\n"
+        f"PID: {process.pid}\n"
+        f"Runtime: {state_path}\n"
+        f"Лог: {log_path}\n",
+        flush=True,
+    )
+    if first_launch:
+        if access_code:
+            print(f"Код доступа первого запуска: {access_code}\n", flush=True)
+        else:
+            print("Первый запуск был, но код доступа смотри в логе. Он не потерялся, просто спрятался по старой доброй традиции.\n", flush=True)
+
+    if open_browser:
+        opened = False
+        try:
+            opened = bool(webbrowser.open(settings["url"], new=2))
+        except Exception:
+            opened = False
+        if opened:
+            print("Браузер тоже пнул. Если он не открылся, значит браузер решил внезапно показать характер.\n", flush=True)
+        else:
+            print(f"Браузер не открылся автоматически. Тогда просто зайди сам: {settings['url']}\n", flush=True)
+    pause()
+
+
+def stop_site_dashboard(project_root: Path) -> None:
+    cls()
+    status = get_site_dashboard_status(project_root, cleanup_stale=False)
+    if not status["running"] or not status.get("pid"):
+        print("Веб-панель и так не запущена. Тут даже останавливать особенно нечего.\n", flush=True)
+        process_state_path = site_dashboard_process_state_path(project_root)
+        if process_state_path.is_file():
+            try:
+                process_state_path.unlink()
+            except OSError:
+                pass
+        pause()
+        return
+
+    pid = int(status["pid"])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"Не удалось остановить веб-панель: {exc}\n", flush=True)
+        pause()
+        return
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if not read_process_command(pid):
+            break
+        time.sleep(0.2)
+    if read_process_command(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.2)
+
+    process_state_path = site_dashboard_process_state_path(project_root)
+    if process_state_path.is_file():
+        try:
+            process_state_path.unlink()
+        except OSError:
+            pass
+
+    print("Веб-панель остановил. Маленький Flask-ларёк больше не болтается в фоне.\n", flush=True)
+    pause()
+
+
+def show_site_dashboard_log(project_root: Path) -> None:
+    cls()
+    log_path = site_dashboard_log_path(project_root)
+    print("=== site_dashboard.log ===", flush=True)
+    print(read_text_tail(log_path), flush=True)
+    pause()
+
+
 def list_recent_problem_long_think_jobs(project_root: Path, limit: int = 3) -> list[dict[str, Any]]:
     root = project_root / "deep_think_jobs"
     if not root.is_dir():
@@ -753,6 +1110,7 @@ def build_port_manual_text() -> str:
         "- Локальная БЗ: быстрый импорт, поиск и чистка документов.\n"
         "- Проекты: индексация папок, просмотр деталей, перескан и удаление индексов.\n"
         "- Фоновые задачи: история очереди и чистка хвостов после индексации.\n"
+        "- Веб-панель: запуск в фоне, статус, лог и открытие в браузере.\n"
         "- Менеджер моделей: список найденных .gguf, быстрая активация, удаление и настройка env.\n"
         "- Проверка обновления и установка новой версии.\n"
         "- Анализ живых long-think/systemd процессов перед установкой обновления.\n"
@@ -938,6 +1296,7 @@ def ensure_python_dependencies(project_root: Path) -> None:
     required = {
         "aiogram": "aiogram>=3.0,<4.0",
         "aiohttp": "aiohttp>=3.9,<4.0",
+        "flask": "Flask>=3.0,<4.0",
     }
     installed_packages = pip_installed_packages()
     missing = [
@@ -3353,6 +3712,43 @@ def model_menu(project_root: Path, state: dict[str, Any]) -> None:
             return
 
 
+def site_dashboard_menu(project_root: Path) -> None:
+    while True:
+        cls()
+        status = get_site_dashboard_status(project_root)
+        print_block(
+            f"""
+            Веб-панель управления всем этим хозяйством.
+            Сейчас она {'работает' if status['running'] else 'остановлена'}.
+            URL: {status['url']}
+            PID: {status.get('pid') or '-'}
+            """
+        )
+        choice = prompt_choice(
+            "Веб-панель",
+            [
+                "Запустить веб-панель в фоне",
+                "Запустить и открыть в браузере",
+                "Показать статус и адрес",
+                "Показать лог веб-панели",
+                "Остановить веб-панель",
+                "Назад",
+            ],
+        )
+        if choice == 1:
+            launch_site_dashboard(project_root, open_browser=False)
+        elif choice == 2:
+            launch_site_dashboard(project_root, open_browser=True)
+        elif choice == 3:
+            show_site_dashboard_status(project_root)
+        elif choice == 4:
+            show_site_dashboard_log(project_root)
+        elif choice == 5:
+            stop_site_dashboard(project_root)
+        else:
+            return
+
+
 def systemd_menu(project_root: Path) -> None:
     while True:
         cls()
@@ -3401,7 +3797,7 @@ def launcher_menu(project_root: Path) -> None:
         print_block(
             """
             Дарова! Linux-пакет на месте.
-            Нужно запустить бота, ковырнуть БЗ, проекты, модели или просто полюбоваться env?
+            Нужно запустить бота, веб-панель, ковырнуть БЗ, проекты, модели или просто полюбоваться env?
             """
         )
         choice = prompt_choice(
@@ -3413,6 +3809,7 @@ def launcher_menu(project_root: Path) -> None:
                 "Локальная БЗ",
                 "Проекты",
                 "Фоновые задачи",
+                "Веб-панель",
                 "Проверить обновление",
                 "Логи ошибок",
                 "Справка по порту",
@@ -3436,21 +3833,23 @@ def launcher_menu(project_root: Path) -> None:
         elif choice == 6:
             tasks_menu(project_root)
         elif choice == 7:
+            site_dashboard_menu(project_root)
+        elif choice == 8:
             cls()
             check_for_project_update(project_root, show_if_latest=True)
             pause()
-        elif choice == 8:
-            show_error_logs(project_root)
         elif choice == 9:
-            show_port_manual()
+            show_error_logs(project_root)
         elif choice == 10:
+            show_port_manual()
+        elif choice == 11:
             model_menu(project_root, state)
             state = load_json(state_path)
-        elif choice == 11:
-            systemd_menu(project_root)
         elif choice == 12:
-            show_env(project_root)
+            systemd_menu(project_root)
         elif choice == 13:
+            show_env(project_root)
+        elif choice == 14:
             edit_env(project_root)
             state = load_json(state_path)
         else:
